@@ -1,25 +1,19 @@
 """
 mito_localization.py
 
-Per-cell mitochondrial radial localization analysis from .lif files (MitoTracker-only, without other fluorescence probes).
-Designed for single .lif file processing (one file per run).
+Per-cell mitochondrial radial localization analysis from only mitochondria-targeted microscopy files.
+Designed for single microscopy file processing (CZI, OME-TIFF, TIFF and LIF formats), one file per run.
 
 Outputs:
  - CSV summary of per-cell metrics
- - PNG plots (one per cell) showing radial distribution of mitochondrial area
- - All outputs saved in an output folder next to the input .lif file
+ - PNG violin plots (one per cell) showing radial distribution of mitochondrial area
+ - All outputs saved in an output folder next to the input file
 
 Usage:
     python mito_localization.py --file /path/to/your_file.lif --channel 0
 
 Dependencies:
-    pip install numpy pandas matplotlib scikit-image aicsimageio tifffile openpyxl
-
-Notes:
- - The script estimates cell outlines from the MitoTracker signal itself.
- - It performs cell segmentation (watershed) and mitochondrial segmentation,
-   then computes normalized radial distances (0=center, 1=furthest cell boundary).
- - Adjust parameters (min_cell_area, inner_frac, etc.) by command-line options.
+    pip install numpy pandas matplotlib scipy scikit-image aicsimageio aicspylibczi tifffile openpyxl
 """
 
 from pathlib import Path
@@ -28,8 +22,12 @@ import logging
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.stats import gaussian_kde
+import matplotlib as mpl
 
-# skimage/scipy imports (no ambiguous overwrites)
+mpl.rcParams["font.family"] = "sans-serif"
+mpl.rcParams["font.sans-serif"] = ["Arial"]
+
 from skimage.filters import threshold_otsu, gaussian
 from skimage.morphology import (
     remove_small_objects,
@@ -54,22 +52,21 @@ def read_scene_projection(img_reader, scene_name, channel_index=0):
     Return 2D max-projected image for the requested scene and channel.
     """
     img_reader.set_scene(scene_name)
-    data = img_reader.get_image_data("CZYX")  # common AICSImage layout
+    data = img_reader.get_image_data("CZYX")  
+ 
     # data can be 3D (C,Y,X) or 4D (C,Z,Y,X)
     if data.ndim == 4:
-        # C, Z, Y, X
         if channel_index >= data.shape[0]:
             raise ValueError(f"channel_index {channel_index} out of range (C={data.shape[0]})")
         ch = data[channel_index]
         img2d = ch.max(axis=0)
     elif data.ndim == 3:
-        # C, Y, X
         if channel_index >= data.shape[0]:
             raise ValueError(f"channel_index {channel_index} out of range (C={data.shape[0]})")
         img2d = data[channel_index]
     else:
         raise ValueError(f"Unexpected image shape: {data.shape}")
-    # normalize to uint8
+
     img2d = img2d.astype(np.float32)
     if img2d.max() > img2d.min():
         img2d = (img2d - img2d.min()) / (img2d.max() - img2d.min())
@@ -79,18 +76,12 @@ def read_scene_projection(img_reader, scene_name, channel_index=0):
     return img2d
 
 def segment_cells_from_mito(mito_img,
-                            gaussian_sigma=2,
-                            min_cell_area=5000,
+                            gaussian_sigma=1.0,
+                            min_cell_area=2000,
                             single_cell_per_scene=False):
-    """
-    Segment cells from a MitoTracker image.
-    Uses smoothing + Otsu + morphological cleanup + connected-components.
-    Returns labeled image (0 background).
-    """
-    # Smooth the image (use scipy.ndimage gaussian to avoid ambiguity)
+
     mito_smooth = ndi.gaussian_filter(mito_img, sigma=gaussian_sigma)
 
-    # Threshold (Otsu) with safe fallback
     try:
         thresh = threshold_otsu(mito_smooth)
     except Exception:
@@ -99,11 +90,10 @@ def segment_cells_from_mito(mito_img,
 
     if cell_mask.sum() == 0:
         return np.zeros_like(cell_mask, dtype=int)
-
-    # Morphological cleanup
+     
     cell_mask = remove_small_objects(cell_mask, min_size=int(min_cell_area))
     cell_mask = binary_closing(cell_mask, footprint=np.ones((5, 5)))
-    # fill holes using scipy ndimage (ndi.binary_fill_holes)
+
     try:
         cell_mask = ndi.binary_fill_holes(cell_mask)
     except Exception:
@@ -113,7 +103,6 @@ def segment_cells_from_mito(mito_img,
     if cell_mask.sum() == 0:
         return np.zeros_like(cell_mask, dtype=int)
 
-    # If user requested a single object per scene, keep only the largest connected component
     if single_cell_per_scene:
         labeled = ndi.label(cell_mask)[0]
         sizes = np.bincount(labeled.ravel())
@@ -124,7 +113,6 @@ def segment_cells_from_mito(mito_img,
         cleaned = (labeled == largest)
         return ndi.label(cleaned)[0]
 
-    # Normal mode: connected components (no watershed)
     labels_seg = ndi.label(cell_mask)[0]
     return labels_seg
 
@@ -196,38 +184,65 @@ def save_cell_overlay(mito_img, cell_mask, mito_mask_cell, radial_norm_cell, out
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close()
 
-def save_radial_histogram(mito_radii, out_path, scene_id, cell_label, bins=20):
+def save_radial_dot_violin(radii, outpath, scene_id, cell_label):
     """
-    Save radial histogram (blue->red gradient).
+    Violin plot made of dots with blue to red radial color scale.
     """
-    plt.figure(figsize=(4,3))
-    if mito_radii.size == 0:
-        plt.text(0.5, 0.5, 'No mitochondria detected', ha='center', va='center')
-        plt.xlim(0,1)
-        plt.ylim(0,1)
-        plt.xlabel('Normalized distance')
-        plt.ylabel('Fraction of mito pixels')
+    if radii is None or len(radii) == 0:
+        print(f"[Scene {scene_id}, Cell {cell_label}] No radii for dot-violin.")
+        return
+
+    radii = np.asarray(radii)
+
+    kde = gaussian_kde(radii)
+    xs = np.linspace(0, 1, 400)
+    density = kde(xs)
+    density = density / density.max() * 0.35  # violin half-width
+
+    if len(radii) > 3000:
+        radii_plot = np.random.choice(radii, size=2000, replace=False)
     else:
-        hist, edges = np.histogram(mito_radii, bins=bins, range=(0,1))
-        if hist.sum() > 0:
-            hist = hist.astype(float) / hist.sum()
-        centers = (edges[:-1] + edges[1:]) / 2.0
-        colors = np.zeros((len(centers), 3))
-        colors[:, 0] = centers
-        colors[:, 2] = 1 - centers
-        plt.bar(centers, hist, width=edges[1]-edges[0], color=colors, edgecolor='k')
-        plt.xlabel('Normalized distance (0=center, 1=periphery)')
-        plt.ylabel('Fraction of mito pixels')
-    plt.title(f"Scene {scene_id} - Cell {cell_label}")
+        radii_plot = radii
+
+    kde_vals = kde(radii_plot)
+    kde_vals = kde_vals / kde_vals.max() * 0.35
+    y_jitter = (np.random.uniform(-1, 1, size=len(kde_vals))) * kde_vals
+
+    colors = np.stack([radii_plot, np.zeros_like(radii_plot), 1 - radii_plot], axis=1)
+
+    plt.figure(figsize=(10, 4))
+    plt.rcParams.update({"font.size": 10})
+
+    plt.plot(xs,  density, color="black", linewidth=0.6)
+    plt.plot(xs, -density, color="black", linewidth=0.6)
+
+    plt.scatter(
+        radii_plot,
+        y_jitter,
+        s=14,
+        c=colors,
+        alpha=0.80,
+        edgecolors="none"
+    )
+
+    median_val = np.median(radii)
+    plt.axvline(median_val, color="gray", linestyle="--", linewidth=0.8)
+
+    plt.yticks([])
+    plt.ylim(-0.40, 0.40)
+    plt.xlim(0, 1)
+    plt.xlabel("Normalized radial distance", labelpad=4)
+    plt.title(f"Cell {cell_label}", pad=4)
+
     plt.tight_layout()
-    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.savefig(outpath, dpi=300)
     plt.close()
 
 # ---------- Main analysis ----------
 
 def analyze_scene(mito_img, scene_id, out_dir, params):
     """
-    Analyze one 2D scene and return per-cell records.
+    Analyze one scene and return per-cell records.
     """
     records = []
     mito_img_f = mito_img.astype(np.float32)
@@ -237,10 +252,9 @@ def analyze_scene(mito_img, scene_id, out_dir, params):
         mito_img_f = mito_img_f * 0.0
 
     # Segment cells & mitochondria
-    # NOTE: use the normalized image for segmentation
     labeled_cells = segment_cells_from_mito(
         mito_img_f,
-        gaussian_sigma=params.get('cell_gaussian_sigma', 2.0),
+        gaussian_sigma=params.get('cell_gaussian_sigma', 1.0),
         min_cell_area=params.get('min_cell_area', 2000),
         single_cell_per_scene=params.get('single_cell_per_scene', False)
     )
@@ -250,12 +264,10 @@ def analyze_scene(mito_img, scene_id, out_dir, params):
         min_mito_area=params.get('min_mito_area', 10)
     )
 
-    # Save scene-level overlay
     scene_overlay_path = out_dir / f"scene_{scene_id:03d}_overlay.png"
     save_scene_overlay(mito_img_f, labeled_cells, mito_labels, scene_overlay_path,
                        title=f"Scene {scene_id}")
 
-    # iterate each labeled cell
     if labeled_cells.max() == 0:
         logging.info(f"Scene {scene_id}: no cells found.")
         return records
@@ -264,11 +276,10 @@ def analyze_scene(mito_img, scene_id, out_dir, params):
         cell_label = prop.label
         cell_mask = (labeled_cells == cell_label)
         area_px = int(cell_mask.sum())
-        if area_px < params.get('min_cell_area', 2000):
+        if area_px < params.get('min_cell_area', 12000):
             logging.debug(f"Scene {scene_id} Cell {cell_label}: skipped (area {area_px})")
             continue
 
-        # centroid and per-cell radial normalization
         cy, cx = prop.centroid
         coords = np.column_stack(np.nonzero(cell_mask))
         if coords.size == 0:
@@ -279,7 +290,6 @@ def analyze_scene(mito_img, scene_id, out_dir, params):
         radial_norm_cell[cell_mask] = dists / max_dist
         radial_norm_cell = np.clip(radial_norm_cell, 0, 1.0)
 
-        # mitochondria inside this cell
         mito_mask_cell = (mito_labels > 0) & cell_mask
         mito_area_px = int(mito_mask_cell.sum())
 
@@ -301,13 +311,12 @@ def analyze_scene(mito_img, scene_id, out_dir, params):
             num_mito_objects = int(len(mito_labels_in_cell))
             mito_radii = mito_dists_norm
 
-        # Save per-cell overlays and histogram
         cell_overlay_path = out_dir / f"scene_{scene_id:03d}_cell_{cell_label:03d}_overlay.png"
         save_cell_overlay(mito_img_f, cell_mask, mito_mask_cell, radial_norm_cell,
                           cell_overlay_path, title=f"Scene {scene_id} - Cell {cell_label}")
 
-        hist_path = out_dir / f"scene_{scene_id:03d}_cell_{cell_label:03d}_radial.png"
-        save_radial_histogram(mito_radii, hist_path, scene_id, cell_label, bins=params.get('hist_bins', 20))
+        dot_path = out_dir / f"scene_{scene_id:03d}_cell_{cell_label:03d}_radial.png"
+        save_radial_dot_violin(mito_radii, dot_path, scene_id, cell_label)
 
         rec = {
             'scene': int(scene_id),
@@ -323,21 +332,27 @@ def analyze_scene(mito_img, scene_id, out_dir, params):
 
     return records
 
-def process_lif_file(lif_path, channel_index=0, params=None):
+def load_image(img_path):
+    img_path = Path(img_path)
+    img = AICSImage(img_path)
+
+    return img
+
+def process_image_file(img_path, channel_index=0, params=None):
     if params is None:
         params = {}
-    lif_path = Path(lif_path)
-    if not lif_path.exists():
-        raise FileNotFoundError(lif_path)
+    img_path = Path(img_path)
+    if not img_path.exists():
+        raise FileNotFoundError(img_path)
 
     if AICSImage is None:
         raise RuntimeError("aicsimageio not available. Install with: pip install aicsimageio")
 
-    out_root = lif_path.with_suffix('')
+    out_root = img_path.with_suffix('')
     output_dir = out_root.parent / (out_root.name + "_mito_localization_results")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    img = AICSImage(str(lif_path))
+    img = AICSImage(str(img_path))
     all_records = []
 
     for s, scene_name in enumerate(img.scenes):
@@ -353,7 +368,7 @@ def process_lif_file(lif_path, channel_index=0, params=None):
         recs = analyze_scene(img2d, s, scene_out, params)
         for r in recs:
             r['scene_name'] = scene_name
-            r['source_file'] = lif_path.name
+            r['source_file'] = img_path.name
             r['output_subfolder'] = str(scene_out.relative_to(output_dir))
             all_records.append(r)
 
@@ -361,8 +376,8 @@ def process_lif_file(lif_path, channel_index=0, params=None):
         logging.warning("No records produced. Check your input and segmentation parameters.")
     else:
         df = pd.DataFrame(all_records)
-        csv_path = output_dir / (lif_path.stem + "_per_cell_summary.csv")
-        xlsx_path = output_dir / (lif_path.stem + "_per_cell_summary.xlsx")
+        csv_path = output_dir / (img_path.stem + "_per_cell_summary.csv")
+        xlsx_path = output_dir / (img_path.stem + "_per_cell_summary.xlsx")
         df.to_csv(csv_path, index=False)
         try:
             df.to_excel(xlsx_path, index=False)
@@ -376,7 +391,7 @@ def process_lif_file(lif_path, channel_index=0, params=None):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Per-cell mitochondrial radial localization (fixed)")
-    p.add_argument('--file', '-f', required=True, help="Path to .lif file")
+    p.add_argument('--file', '-f', required=True, help="Path to .lif/.czi file")
     p.add_argument('--channel', '-c', type=int, default=0, help="Channel index for MitoTracker (default 0)")
     p.add_argument('--min-cell-area', type=int, default=2000, help="Minimum cell area in px to keep (default 2000)")
     p.add_argument('--min-mito-area', type=int, default=10, help="Minimum mitochondrial area in px (default 10)")
@@ -404,7 +419,7 @@ def main():
         'watershed_compactness': args.watershed_compactness,
         'hist_bins': args.hist_bins
     }
-    out = process_lif_file(args.file, channel_index=args.channel, params=params)
+    out = process_image_file(args.file, channel_index=args.channel, params=params)
     print("Done. Output folder:", out)
 
 if __name__ == '__main__':
