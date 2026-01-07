@@ -1,0 +1,90 @@
+# mito_localization
+
+Quantitative analysis of mitochondrial spatial localization from fluorescence microscopy images
+
+This repository contains a Python script to quantify mitochondrial localization patterns (perinuclear vs peripheral) in single cells using mitochondria-targeted fluorescence microscopy images.
+
+The method and computational pipeline are described in the accompanying preprint:
+
+> Cavalcante GC & Kowaltowski AJ  
+> *Quantitative assessment of mitochondrial spatial distribution from fluorescence microscopy images*  
+> bioRxiv (2026)  
+> https://www.biorxiv.org/content/10.64898/2026.01.06.697902v1
+
+---
+
+# Overview
+
+Mitochondrial positioning is closely linked to cellular metabolism, signaling, and disease phenotypes.  
+This script implements an automated image-analysis pipeline that:
+
+1. Segments individual cells
+2. Detects mitochondrial signal
+3. Computes spatial distribution relative to the nuclear region
+4. Classifies mitochondrial localization as perinuclear or peripheral
+
+The pipeline was designed for reproducibility, transparency, and biological interpretability.
+
+---
+
+# Supported image formats
+
+- `.tif / .tiff`
+- `.czi`
+- `.lif`
+
+(As long as they contain mitochondria-targeted fluorescence channels.)
+
+---
+
+# Requirements
+
+The software requirements are summarized in **Figure 1 of the preprint** and include the following Python ecosystem:
+
+- Python **≥ 3.8**
+- NumPy
+- SciPy
+- scikit-image
+- pandas
+- matplotlib
+- tifffile
+- czifile # (for `.czi` files)
+- readlif # (for `.lif` files)
+
+# Installation
+
+```bash
+git clone https://github.com/cavalcantegc/mito_localization.git
+cd mito_localization
+
+python -m venv venv
+source venv/bin/activate  # Linux / macOS
+venv\Scripts\activate     # Windows
+
+pip install numpy scipy scikit-image pandas matplotlib tifffile czifile readlif
+
+# Usage example
+
+python mito_localization.py --file path/to/image.tif --channel 0
+
+# Outputs
+
+The script produces:
+
+- Quantitative metrics of mitochondrial spatial distribution
+- Classification of localization pattern (perinuclear vs. peripheral)
+- Optional diagnostic plots for segmentation and spatial analysis
+- Results are suitable for downstream statistical analysis and figure generation.
+
+# Citation
+
+If you use this code in your research, please cite:
+
+Cavalcante GC et al.
+Quantitative assessment of mitochondrial spatial distribution from fluorescence microscopy images.
+bioRxiv (2026).
+DOI: 10.64898/2026.01.06.697902v1
+
+# License
+
+This project is licensed under the BSD 3-Clause License.
